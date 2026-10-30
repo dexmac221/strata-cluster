@@ -15,6 +15,7 @@
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/spec_prob.hpp"
 #include "strata/core/spec_proposal.hpp"
+#include "strata/net/stage_link.hpp"
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -3059,6 +3060,15 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
 
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
+    // strati-in-rete, the last PC's first stage: the window's hand-in comes over the link, its chain's picks go back
+    if (net_in_ != nullptr && !net_inner_) {
+        if (!net_recv_window(T, tokens, pos0, err)) return false;
+        net_inner_ = true;
+        const bool ok = run(T, tokens, pos0, pool, user, out, err);
+        net_inner_ = false;
+        net_send_result(ok, T, out, err);
+        return ok;
+    }
     const bool measure = spec_measure_;
     // Clear this borrow and propagated stage borrows on every exit.
     struct ProposalBorrow {
@@ -3374,6 +3384,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
+        // strati-in-rete, the first PC's last stage: the hand-off goes to the other PC, which answers with the picks
+        if (net_out_ != nullptr) return net_exchange(T, tokens, pos0, out, err);
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
@@ -3708,6 +3720,120 @@ bool Verifier::wait_commit(std::string& err) {
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     }
     return next_ == nullptr || next_->wait_commit(err);
+}
+
+// strati-in-rete (set_net_in / set_net_out).  The hand-off buffers are mapped pinned memory, and with unified
+// addressing their device pointer is the host's: the link reads and fills them in place.
+namespace {
+bool host_visible(const float* p) {
+    cudaPointerAttributes at{};
+    const bool ok = p != nullptr && cudaPointerGetAttributes(&at, p) == cudaSuccess && at.type == cudaMemoryTypeHost &&
+                    at.hostPointer == p;
+    (void) cudaGetLastError();
+    return ok;
+}
+}   // namespace
+
+// The last PC's first stage, before its window: the first PC's hand-off for the same window, into hand_in_.
+bool Verifier::net_recv_window(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
+    using strata::net::Msg;
+    if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+    if (!host_visible(hand_in_)) { err = "verify: the network hand-in is not host memory at the same address"; return false; }
+    const Clock::time_point t0 = Clock::now();
+    const size_t hand_bytes = (size_t) T * (size_t) handoff_floats(*g_) * sizeof(float);
+    Msg k;
+    uint64_t bytes = 0;
+    strata::net::WindowHead w;
+    if (!net_in_->recv_header(k, bytes, err)) return false;
+    if (k != Msg::Window || bytes < sizeof w || !net_in_->recv_bytes(&w, sizeof w, err)) {
+        if (err.empty()) err = "verify: the other PC sent something else than a window";
+        return false;
+    }
+    int32_t theirs[strata::kernels::kVerifyMaxT] = {};
+    const bool shape_ok = w.T == T && w.pos0 == pos0 &&
+                          bytes == sizeof w + (uint64_t) T * sizeof(int32_t) + (uint64_t) hand_bytes;
+    if (!shape_ok || !net_in_->recv_bytes(theirs, (size_t) T * sizeof(int32_t), err) ||
+        !net_in_->recv_bytes(const_cast<float*>(hand_in_), hand_bytes, err)) {
+        if (err.empty())
+            err = "verify: the two PCs are out of step (window T " + std::to_string(w.T) + " at " + std::to_string(w.pos0) +
+                  " there, T " + std::to_string(T) + " at " + std::to_string(pos0) + " here)";
+        return false;
+    }
+    for (int t = 0; t < T; ++t)
+        if (theirs[t] != tokens[t]) {
+            err = "verify: the two PCs are out of step (token " + std::to_string(t) + " of the window at " +
+                  std::to_string(pos0) + " differs)";
+            return false;
+        }
+    if (net_stop_synced_ != nullptr) net_stop_synced_->store((w.flags & strata::net::kWindowStop) != 0);
+    std::atomic_thread_fence(std::memory_order_seq_cst);   // the hand-in is in host memory before the graph reads it
+    ms_net += ms_since(t0);
+    ++net_windows;
+    return true;
+}
+
+// The last PC's first stage, after its chain ran the window: the picks (or the error) back to the first PC.
+void Verifier::net_send_result(bool ok, int T, const int32_t* out, const std::string& err) {
+    using strata::net::Msg;
+    const Clock::time_point t0 = Clock::now();
+    strata::net::ResultHead r;
+    r.T = T;
+    r.ok = ok ? 1 : 0;
+    std::string se;
+    if (ok) {
+        r.nf_row = nonfinite_row();
+        r.nf_pos = nonfinite_pos();
+        for (int t = 0; t < T && t < 32; ++t)
+            if (nonfinite_in(t)) r.nf_mask |= 1u << t;
+        (void) net_in_->send(Msg::Result, {{&r, sizeof r}, {out, (size_t) T * sizeof(int32_t)}}, se);
+    } else {
+        r.err_bytes = (uint32_t) err.size();
+        (void) net_in_->send(Msg::Result, {{&r, sizeof r}, {err.data(), err.size()}}, se);
+    }
+    ms_net += ms_since(t0);
+}
+
+// The first PC's last stage, its hand-off written: send it with the window, take the last stage's picks back.
+bool Verifier::net_exchange(int T, const int32_t* tokens, int64_t pos0, int32_t* out, std::string& err) {
+    using strata::net::Msg;
+    if (!host_visible(hand_out_)) { err = "verify: the network hand-off is not host memory at the same address"; return false; }
+    const Clock::time_point t0 = Clock::now();
+    const size_t hand_bytes = (size_t) T * (size_t) handoff_floats(*g_) * sizeof(float);
+    strata::net::WindowHead w;
+    w.T = T;
+    w.pos0 = pos0;
+    if (net_stop_seen_ != nullptr && net_stop_synced_ != nullptr) {   // the STOP both PCs act on after this window
+        const bool stop = net_stop_seen_->load();
+        net_stop_synced_->store(stop);
+        if (stop) w.flags |= strata::net::kWindowStop;
+    }
+    if (!net_out_->send(Msg::Window, {{&w, sizeof w}, {tokens, (size_t) T * sizeof(int32_t)}, {hand_out_, hand_bytes}}, err))
+        return false;
+    Msg k;
+    uint64_t bytes = 0;
+    strata::net::ResultHead r;
+    if (!net_out_->recv_header(k, bytes, err)) return false;
+    if (k != Msg::Result || bytes < sizeof r || !net_out_->recv_bytes(&r, sizeof r, err)) {
+        if (err.empty()) err = "verify: the other PC answered a window with something else";
+        return false;
+    }
+    if (r.ok != 1) {
+        std::string e(r.err_bytes, '\0');
+        if (r.err_bytes > 0 && !net_out_->recv_bytes(e.data(), e.size(), err)) return false;
+        err = "the other PC's stage: " + e;
+        return false;
+    }
+    if (r.T != T || bytes != sizeof r + (uint64_t) T * sizeof(int32_t) ||
+        !net_out_->recv_bytes(out, (size_t) T * sizeof(int32_t), err)) {
+        if (err.empty()) err = "verify: the other PC's reply does not match the window";
+        return false;
+    }
+    nf_row_ = r.nf_row;
+    nf_pos_ = r.nf_pos;
+    nf_mask_ = r.nf_mask;
+    ms_net += ms_since(t0);
+    ++net_windows;
+    return true;
 }
 
 
@@ -4766,6 +4892,7 @@ bool Verifier::copy_logits(int t, float* host) const {
     return strata::metal_engine::window_copy_logits(metal_, t, host);
 #endif
     if (next_ != nullptr) return next_->copy_logits(t, host);   // a layer split: the head is on the last stage
+    if (net_out_ != nullptr) return false;   // strati-in-rete: the head's logits are on the other PC
     if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
     return cudaMemcpy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float),
                       cudaMemcpyDeviceToHost) == cudaSuccess;

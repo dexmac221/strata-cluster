@@ -1654,7 +1654,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (!stage_source_R(T, err)) return false;
 
     SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
-    const bool do_ple = pss != nullptr && pss->ple.ready() && pss->ple.table != nullptr;
+    const bool do_ple = !ple_off_ && pss != nullptr && pss->ple.ready() && pss->ple.table != nullptr;
     int32_t ple_prev[2] = {do_ple ? pss->ple_prev[0] : 0, do_ple ? pss->ple_prev[1] : 0};
     const bool dth = g_dt.on;
     auto hms = [](Clock::time_point a0) { return std::chrono::duration<double, std::milli>(Clock::now() - a0).count(); };

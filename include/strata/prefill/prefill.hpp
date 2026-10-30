@@ -16,6 +16,7 @@
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -24,6 +25,8 @@
 
 namespace strata::core { class PeerExperts; }
 namespace strata::kernels::cpu { class ExpertPool; }
+
+namespace strata::net { class StageLink; }
 
 namespace strata::prefill {
 
@@ -236,6 +239,18 @@ public:
     void set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
     }
+    /// LAYER SPLIT ACROSS TWO PCs (experimental, strati-in-rete).  plan_net_out (before `init`): this stage ends where
+    /// the other PC begins and has no `next` here - init allocates its hand-off buffers all the same, and each chunk's
+    /// rows go over the link set_net_out names (on a thread, as to a next stage: this stage reads chunk c + 1 while the
+    /// other PC reads chunk c, and waits for its acknowledgement of c first).  set_net_in: this stage begins at that
+    /// layer, and run() takes the other PC's chunks from the link one by one, as a later stage takes its
+    /// predecessor's, until the other PC says the prompt is over.
+    void plan_net_out() { net_out_planned_ = true; }
+    void set_net_out(strata::net::StageLink* link) { net_out_ = link; }
+    void set_net_in(strata::net::StageLink* link) { net_in_ = link; }
+    /// The request's STOP across the PCs (Verifier::set_net_stop): the first PC latches `seen` into `synced` at the
+    /// prompt's end and sends it; the last PC (`seen` null) takes it there.  On the stage set_net_out / set_net_in names.
+    void set_net_stop(std::atomic<bool>* seen, std::atomic<bool>* synced) { net_stop_seen_ = seen; net_stop_synced_ = synced; }
 
     /// LAYER SPLIT: `helper` is another stage's prompt path (another GPU).  A prompt of one chunk runs the stages one
     /// after the other, so while this stage reads it the helper's GPU idles: it then streams a share of this stage's
@@ -312,6 +327,17 @@ private:
     std::string next_err_;
     std::future<bool> next_run_;
     int hand_buf_ = 0;
+
+    bool net_out_planned_ = false;              ///< plan_net_out
+    strata::net::StageLink* net_out_ = nullptr; ///< set_net_out
+    strata::net::StageLink* net_in_ = nullptr;  ///< set_net_in
+    std::atomic<bool>* net_stop_seen_ = nullptr;   ///< set_net_stop
+    std::atomic<bool>* net_stop_synced_ = nullptr;
+    float* net_rows_ = nullptr;                 ///< the last PC's first stage: one incoming chunk's rows (pinned)
+    size_t net_rows_bytes_ = 0;
+    bool net_run_in(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    bool net_send_chunk(const float* rows, const int64_t* tokens, int64_t c0, int64_t T, int64_t p0, bool single_chunk,
+                        bool pipe_chunked);
 
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)

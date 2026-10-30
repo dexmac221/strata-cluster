@@ -38,6 +38,8 @@
 #include <string>
 #include <vector>
 
+namespace strata::net { class StageLink; }
+
 namespace strata::core {
 
 /// 0.1.43 (STRATA_ADAPT_OVERLAP): the adaptive tier's copies still landing while a decode window runs.  The window's
@@ -397,7 +399,29 @@ public:
     /// STRATA_ROUTE_STATS=1: per window size, the routed experts per layer: distinct, and new per row (not in the rows before it). Resets.
     std::string route_stats_report();
 
+    /// LAYER SPLIT ACROSS TWO PCs (experimental, strati-in-rete; --net-role): the two engines advance in step (the same
+    /// requests, the same windows), each running its own layers on its own GPUs.  set_net_out: this is the first PC's
+    /// last stage - its range ends where the other PC's begins, and run() sends the hand-off it wrote over `link` and
+    /// takes the last stage's picks from the reply instead of chaining on.  set_net_in: this is the last PC's first
+    /// stage - its range begins at that layer, and run() fills its hand-in from `link` before the window and sends
+    /// the picks of its chain back after it.  The hand-off buffer of set_stage is the one the link reads or fills.
+    void set_net_out(strata::net::StageLink* link) { net_out_ = link; }
+    void set_net_in(strata::net::StageLink* link) { net_in_ = link; }
+    /// The request's STOP across the PCs: on the first PC `seen` is the stdin STOP, latched into `synced` as each window
+    /// goes out (and sent with it); on the last PC (`seen` null) `synced` takes what each window carried.
+    void set_net_stop(std::atomic<bool>* seen, std::atomic<bool>* synced) { net_stop_seen_ = seen; net_stop_synced_ = synced; }
+    double ms_net = 0;    ///< time in the link: sending, and waiting for the other PC's reply or next window
+    int64_t net_windows = 0;
+
 private:
+    bool net_recv_window(int T, const int32_t* tokens, int64_t pos0, std::string& err);
+    void net_send_result(bool ok, int T, const int32_t* out, const std::string& err);
+    bool net_exchange(int T, const int32_t* tokens, int64_t pos0, int32_t* out, std::string& err);
+    strata::net::StageLink* net_out_ = nullptr;
+    strata::net::StageLink* net_in_ = nullptr;
+    bool net_inner_ = false;   ///< run() is serving the window net_recv_window just took
+    std::atomic<bool>* net_stop_seen_ = nullptr;
+    std::atomic<bool>* net_stop_synced_ = nullptr;
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool capture(int T, std::string& err);
     // batch windows (see init_slots)

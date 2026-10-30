@@ -70,6 +70,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
+#include "strata/net/stage_link.hpp"
 #include "strata/core/gated_proposal.hpp"
 #if defined(STRATA_HAVE_DFLASH2)
 #include "strata/core/dflash2.hpp"
@@ -790,6 +791,14 @@ struct Options {
     /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
     /// GPU, sharing everything - the bit-exact A/B of the hand-off)
     std::string split_device;
+    /// --net-role first|last --net-split K --net-addr HOST:PORT (experimental, strati-in-rete): a layer split across two
+    /// PCs that advance in step.  "first" computes layers 0..K-1 (and may split them over its own GPUs with --layer-split
+    /// below K), "last" computes K.. with the head and the drafter (its own --layer-split above K); the boundary
+    /// stages hand off over TCP.  The first connects to HOST:PORT and forwards every request line; the last listens on
+    /// PORT.  0 = off.
+    int net_role = 0;
+    int64_t net_split = 0;
+    std::string net_addr;
     /// --split-skip-if-fits (opt-in; the server passes it for a config's "split_skip_if_fits"): with
     /// --layer-split auto, run on CUDA0 alone when it holds every profiled expert pair plus the whole session (KV),
     /// the drafter and the reserve - a split then only adds hand-offs (two RDNA4 cards: 1,384 vs 1,794 tok/s at 4K)
@@ -1007,6 +1016,8 @@ void usage() {
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
                  "                       of the batched prompt path (default 64, 0 = off)\n"
+                 "  --net-role first|last --net-split K --net-addr HOST:PORT  --serve, experimental: layers 0..K-1\n"
+                 "                       on this PC (first) or K.. (last), in step with the other PC's engine\n"
                  "  --prefill-head-alias --serve: unload the native output head while each fresh prompt is read,\n"
                  "                       then release prompt buffers and reload it before decode\n"
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
@@ -3207,6 +3218,12 @@ int main(int argc, char** argv) {
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
+        else if (a == "--net-role") {
+            const std::string r = next("--net-role");
+            o.net_role = r == "first" ? 1 : r == "last" ? 2 : -1;
+        }
+        else if (a == "--net-addr") o.net_addr = next("--net-addr");
+        else if (a == "--net-split") o.net_split = std::atoll(next("--net-split"));
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
         else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::min(2, std::atoi(next("--pipeline-windows"))));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
@@ -3568,6 +3585,32 @@ int main(int argc, char** argv) {
         }
     }
     bool multi_gpu = !split_devs.empty() && !split_same;   // cleared by --split-skip-if-fits before any stage loads
+    // strati-in-rete: the two engines must take the same decisions window after window, so everything that decides from
+    // this PC's own timings or RAM is off (prompt lookup, lookup chains, checkpoints, parking, batch, pipelined windows)
+    int64_t net_lb = 0, net_le = 0;   // the layers this engine computes
+    if (o.net_role != 0) {
+        bool local_ok = !split_auto && !split_same;
+        for (const int64_t k : split_at) local_ok = local_ok && (o.net_role == 1 ? k < o.net_split : k > o.net_split);
+        const char* why = o.net_role < 0 ? "--net-role is first or last"
+                        : !o.serve ? "it needs --serve"
+                        : o.net_split < 2 ? "it needs --net-split K (the first layer of the last PC)"
+                        : !local_ok ? "this PC's own --layer-split must be explicit, below --net-split on the first PC and above it on the last"
+                        : o.net_addr.find(':') == std::string::npos ? "it needs --net-addr HOST:PORT"
+                        : o.batch != 0 || o.pipeline_windows > 0 ? "it does not take --batch or --pipeline-windows"
+                        : o.suffix_draft != 0 || o.lookup_chain != 0 ? "it needs --suffix-draft 0 (and no --lookup-chain)"
+                        : o.prompt_cache != 0 || o.conversation_cache_mib != 0 ? "it needs --prompt-cache 0 --conversation-cache-mib 0"
+                        : nullptr;
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata serve: --net-role: %s\n", why);
+            return 2;
+        }
+        net_lb = o.net_role == 1 ? 0 : o.net_split;
+        net_le = o.net_role == 1 ? o.net_split : INT64_MAX;   // the last PC: to the model's last layer
+        std::fprintf(stderr, "strata serve: strati-in-rete: this engine computes layers %lld-%s (the %s PC) on %d GPU(s), "
+                             "the other PC is %s\n", (long long) net_lb,
+                     o.net_role == 1 ? std::to_string(net_le - 1).c_str() : "the last",
+                     o.net_role == 1 ? "first" : "last", (int) split_at.size() + 1, o.net_addr.c_str());
+    }
     // STRATA_PRIMARY_DEVICE: a later stage's list (`--split-device` values must be > 0) still assumes the
     // primary is device 0 - refuse the combination rather than mis-place a stage.  The peer tier takes the
     // primary into account (peer_experts.cpp).
@@ -5078,6 +5121,15 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        // strati-in-rete: this engine's cache holds only its own layers' experts (the other PC serves the rest)
+        if (o.net_role != 0) {
+            const size_t before = profile.size();
+            profile.erase(std::remove_if(profile.begin(), profile.end(),
+                                         [&](const std::pair<int32_t, int32_t>& pr) { return pr.first < net_lb || pr.first >= net_le; }),
+                          profile.end());
+            std::fprintf(stderr, "strata generate: strati-in-rete: the profile keeps %zu of %zu pairs (this engine's layers)\n",
+                         profile.size(), before);
+        }
         // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the
         // file).  `--expert-cache 0` used to take the count the profile was built for; the profile now ranks
         // every pair (issue #46: a card that holds more than the old 8,000 used to stop there), so it means auto.
@@ -6216,6 +6268,7 @@ int main(int argc, char** argv) {
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
+        if (o.net_role == 2) mtp.disable_ple_prefetch();   // strati-in-rete: the PLE block runs on the other PC
 #if defined(STRATA_HAVE_DFLASH2)
         if (o.draft == "dflash2") {
             const char* why = o.mtp.empty() ? "it needs --mtp (the fallback) and --spec 2 or more"
@@ -8280,9 +8333,14 @@ int main(int argc, char** argv) {
             static const bool keep = std::getenv("STRATA_ARENA_RELEASE") && std::getenv("STRATA_ARENA_RELEASE")[0] == '0';
             rss_probe("before the release");
             uint64_t released = 0;
+            // strati-in-rete: the other PC's layers are never read here - their pages go back too, and are not prefetched
+            auto foreign = [&](size_t i) {
+                const int64_t l = (int64_t) i / g.n_expert;
+                return o.net_role != 0 && (l < net_lb || l >= net_le);
+            };
             if (!keep)
                 for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] != strata::core::kNotResident)
+                    if (host_res[i] != strata::core::kNotResident || foreign(i))
                         released += srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
             if (released > 0)
                 std::fprintf(stderr, "strata generate: expert arena: %.2f GiB of VRAM-held experts handed back to the OS\n",
@@ -8290,7 +8348,7 @@ int main(int argc, char** argv) {
             rss_probe("after the release");
             int64_t pf = 0;
             for (size_t i = 0; i < host_res.size(); ++i)
-                if (host_res[i] == strata::core::kNotResident) {
+                if (host_res[i] == strata::core::kNotResident && !foreign(i)) {
                     srcp->prefetch((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
                     ++pf;
                 }
@@ -9022,6 +9080,11 @@ int main(int argc, char** argv) {
                 for (int64_t e = 0; e < g.n_expert; ++e)
                     if (remote_experts[(size_t) r].holds(l, (int32_t) e)) stage_pairs.emplace_back((int32_t) l, (int32_t) e);
         }
+        // strati-in-rete: the other PC's layers are never read here - the RAM copy holds this PC's half of the model
+        if (o.net_role != 0)
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                if (l < net_lb || l >= net_le)
+                    for (int64_t e = 0; e < g.n_expert; ++e) stage_pairs.emplace_back((int32_t) l, (int32_t) e);
         // The split's lend regions.  The serve scan lends the tail slots of EVERY part's cache - CUDA0's own
         // part first, then every stage (the `pf_parts` loop below) - and `lend_from` above is switched off in
         // pin_cache_complement the moment `additional_gpu_pairs` is non-empty, so until now none of those experts
@@ -9701,6 +9764,10 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < stages.size(); ++i) {
                 GpuStage& st = *stages[i];
                 st.sp.set_stage(st.lb, i + 1 < stages.size() ? st.le : -1, i + 1 < stages.size() ? &stages[i + 1]->sp : nullptr);
+                if (o.net_role == 1 && i + 1 == stages.size()) {   // strati-in-rete: the first PC's last stage ends at the split
+                    st.sp.set_stage(st.lb, o.net_split, nullptr);
+                    st.sp.plan_net_out();
+                }
                 const strata::core::OnDevice on(st.dev);
                 void* sb = nullptr;              // this stage's own loan, out of its own cache
                 uint64_t sbb = 0;
@@ -9716,7 +9783,11 @@ int main(int argc, char** argv) {
                     return err.find("do not fit") != std::string::npos ? 2 : 1;
                 }
             }
-            if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
+            if (multi_gpu) sp.set_stage(o.net_role == 2 ? o.net_split : 0, split_at[0], &stages[0]->sp);
+            else if (o.net_role != 0) {   // strati-in-rete on one GPU: this PC's layers only
+                sp.set_stage(net_lb, o.net_role == 1 ? net_le : -1, nullptr);
+                if (o.net_role == 1) sp.plan_net_out();
+            }
             if (share_pool) sp.set_cpu_pool(&pool);
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
                          o.prefill_head_alias))
@@ -9900,6 +9971,21 @@ int main(int argc, char** argv) {
         // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
         // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
         strata::core::Verifier ver_same;
+        strata::net::StageLink net_link;   // strati-in-rete (--net-role): the other PC's engine
+        // ... and the hand-off that crosses to it: mapped pinned memory like the split's, so the boundary stage's graph
+        // writes (first PC) or reads (last PC) it in place while the link sends or fills it from the host
+        float* net_hand = nullptr;
+        if (o.net_role != 0) {
+            const size_t nb = (size_t) strata::kernels::kVerifyMaxT *
+                              (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+            float* hh = nullptr;
+            if (cudaHostAlloc((void**) &hh, nb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostGetDevicePointer((void**) &net_hand, hh, 0) != cudaSuccess) {
+                std::fprintf(stderr, "strata serve: strati-in-rete: the network hand-off allocation failed\n");
+                return 1;
+            }
+            std::memset(hh, 0, nb);
+        }
         SplitDrive split_drive;
         auto stage_ver = [&](int st) -> strata::core::Verifier& {
             return st == 0 ? ver : split_same ? ver_same : stages[(size_t) st - 1]->ver;
@@ -9976,8 +10062,15 @@ int main(int argc, char** argv) {
             split_drive.base = &drive;
             split_drive.n = n_stages;
             for (int st = 0; st < n_stages; ++st) {
-                stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1], st + 1 < n_stages ? split_at[(size_t) st] : -1,
-                                        st == 0 ? nullptr : hand[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
+                int64_t lb_st = st == 0 ? 0 : split_at[(size_t) st - 1];
+                int64_t le_st = st + 1 < n_stages ? split_at[(size_t) st] : -1;
+                const float* in_st = st == 0 ? nullptr : hand[(size_t) st - 1];
+                float* out_st = st + 1 < n_stages ? hand[(size_t) st] : nullptr;
+                // strati-in-rete: the first PC's last stage ends where the other PC begins and hands off to the link;
+                // the last PC's first stage begins there and takes its input from the link
+                if (o.net_role == 1 && st + 1 == n_stages) { le_st = o.net_split; out_st = net_hand; }
+                if (o.net_role == 2 && st == 0) { lb_st = o.net_split; in_st = net_hand; }
+                stage_ver(st).set_stage(lb_st, le_st, in_st, out_st);
                 if (hrows > strata::kernels::kVerifyMaxT) stage_ver(st).set_handoff_rows(hrows);
                 if (overlap)
                     stage_ver(st).set_handoff_flags(st == 0 ? nullptr : hflag_h[(size_t) st - 1],
@@ -10088,6 +10181,9 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+        if (o.net_role != 0 && n_stages == 1)   // strati-in-rete on one GPU: this PC's layers, the link on the far side
+            ver.set_stage(net_lb, o.net_role == 1 ? net_le : -1, o.net_role == 2 ? net_hand : nullptr,
+                          o.net_role == 1 ? net_hand : nullptr);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
                       batch_max_t(), err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
@@ -10097,6 +10193,54 @@ int main(int argc, char** argv) {
         }
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
+        // strati-in-rete: connect to the other PC and agree on the split before the first window
+        if (o.net_role != 0) {
+            const size_t colon = o.net_addr.rfind(':');
+            const std::string host = o.net_addr.substr(0, colon);
+            const int port = std::atoi(o.net_addr.c_str() + colon + 1);
+            std::fprintf(stderr, "strata serve: strati-in-rete: %s %s\n",
+                         o.net_role == 1 ? "connecting to" : "waiting for the first PC on port", o.net_addr.c_str());
+            const bool linked = o.net_role == 1 ? net_link.connect_to(host, port, 1800, err)
+                                                : net_link.listen_accept(port, err);
+            strata::net::StageHello mine, theirs;
+            mine.layer_split = (uint32_t) o.net_split;
+            mine.n_layers = (uint32_t) g.n_layers;
+            mine.n_embd = (uint32_t) g.n_embd;
+            mine.hc = (uint32_t) g.hc;
+            mine.max_t = (uint32_t) ver.max_t();
+            mine.handoff_floats = (uint64_t) strata::core::Verifier::handoff_floats(g);
+            mine.prefill_chunk = (uint64_t) sp.chunk();
+            const bool greeted = linked &&
+                (o.net_role == 1 ? net_link.send(strata::net::Msg::Hello, {{&mine, sizeof mine}}, err) &&
+                                   net_link.recv(strata::net::Msg::Hello, {{&theirs, sizeof theirs}}, err)
+                                 : net_link.recv(strata::net::Msg::Hello, {{&theirs, sizeof theirs}}, err) &&
+                                   net_link.send(strata::net::Msg::Hello, {{&mine, sizeof mine}}, err));
+            if (!greeted) {
+                std::fprintf(stderr, "strata serve: strati-in-rete: %s\n", err.c_str());
+                return 1;
+            }
+            if (std::memcmp(&mine, &theirs, sizeof mine) != 0) {
+                std::fprintf(stderr, "strata serve: strati-in-rete: the two engines differ (split %u/%u, layers %u/%u, "
+                                     "max window %u/%u, hand-off %llu/%llu floats, prompt chunk %llu/%llu): start both with "
+                                     "the same model and arguments (a fixed --prefill N)\n", mine.layer_split, theirs.layer_split,
+                             mine.n_layers, theirs.n_layers, mine.max_t, theirs.max_t, (unsigned long long) mine.handoff_floats,
+                             (unsigned long long) theirs.handoff_floats, (unsigned long long) mine.prefill_chunk,
+                             (unsigned long long) theirs.prefill_chunk);
+                return 1;
+            }
+            // the first PC's last stage sends its hand-off; the last PC's first stage (`ver`) takes it - for the decode
+            // windows and the prompt chunks alike
+            if (o.net_role == 1) {
+                stage_ver(n_stages - 1).set_net_out(&net_link);
+                (stages.empty() ? sp : stages.back()->sp).set_net_out(&net_link);
+            } else {
+                ver.set_net_in(&net_link);
+                sp.set_net_in(&net_link);
+            }
+            std::fprintf(stderr, "strata serve: strati-in-rete: linked, %s\n",
+                         o.net_role == 1 ? "the layers from the split on run on the other PC"
+                                         : "the layers before the split run on the other PC");
+        }
         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
         std::vector<std::unique_ptr<float, decltype(free_slot_mtp_rows)>> slot_mtp_rows;
         if (batch_mtp) {
@@ -11974,7 +12118,10 @@ int main(int argc, char** argv) {
             bool eof = false;
         };
         const auto in_shared = std::make_shared<StdinShared>();
-        std::atomic<bool>& stop_req = in_shared->stop_req;
+        // strati-in-rete: the request's STOP is the one both PCs act on (Verifier / Prefill::set_net_stop): the first PC's
+        // stdin STOP is latched into it as each window or prompt end goes out, the last PC's comes with them
+        std::atomic<bool> net_stop{false};
+        std::atomic<bool>& stop_req = o.net_role != 0 ? net_stop : in_shared->stop_req;
         std::mutex& in_mu = in_shared->mu;
         std::condition_variable& in_cv = in_shared->cv;
         std::deque<std::string>& in_lines = in_shared->lines;
@@ -12022,14 +12169,57 @@ int main(int argc, char** argv) {
             st->cv.notify_one();
         }).detach();
         auto next_line = [&](std::string& out) -> bool {
+            // strati-in-rete: the last stage's engine takes its request lines from the first stage's, which forwards
+            // each line it reads, so both run the same requests in step (its own stdin is not read)
+            if (o.net_role == 2) {
+                strata::net::Msg k;
+                uint64_t bytes = 0;
+                std::string e;
+                // the link broken (the first PC's engine ended without its Bye, or the network went away) or out of
+                // step: exit 1, not the 0 of an end of input, so a supervisor (Restart=on-failure) starts this engine
+                // again and it waits for the first PC's next one
+                auto lost = [&](const std::string& why) {
+                    std::fprintf(stderr, "strata serve: strati-in-rete: %s\n", why.c_str());
+                    std::fflush(stderr);
+                    std::fflush(stdout);
+                    std::_Exit(1);
+                };
+                if (!net_link.recv_header(k, bytes, e)) lost("the link to the first PC is gone: " + e);
+                if (k == strata::net::Msg::Bye) return false;
+                if (k != strata::net::Msg::Line || bytes > (64u << 20)) lost("expected a request line from the other PC");
+                out.assign((size_t) bytes, '\0');
+                if (!net_link.recv_bytes(out.data(), out.size(), e)) lost("the link to the first PC is gone: " + e);
+                return true;
+            }
             std::unique_lock<std::mutex> lk(in_mu);
             in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
-            if (in_lines.empty()) return false;
+            if (in_lines.empty()) {
+                std::string e;
+                if (o.net_role == 1) (void) net_link.send(strata::net::Msg::Bye, {}, e);
+                return false;
+            }
             out = std::move(in_lines.front());
             in_lines.pop_front();
+            lk.unlock();
+            if (o.net_role == 1) {
+                std::string e;
+                if (!net_link.send(strata::net::Msg::Line, {{out.data(), out.size()}}, e)) {
+                    std::fprintf(stderr, "strata serve: strati-in-rete: %s\n", e.c_str());
+                    return false;
+                }
+            }
             return true;
         };
-        sp.should_stop = [&] { return stop_req.load(); };
+        // (the first PC's prompt read stops on the stdin STOP itself and its end carries the STOP over; the other PC's
+        // follows the first PC's chunks and never stops on its own)
+        sp.should_stop = [&] { return o.net_role == 1 ? in_shared->stop_req.load() : o.net_role == 2 ? false : stop_req.load(); };
+        if (o.net_role == 1) {
+            stage_ver(n_stages - 1).set_net_stop(&in_shared->stop_req, &net_stop);
+            (stages.empty() ? sp : stages.back()->sp).set_net_stop(&in_shared->stop_req, &net_stop);
+        } else if (o.net_role == 2) {
+            ver.set_net_stop(nullptr, &net_stop);
+            sp.set_net_stop(nullptr, &net_stop);
+        }
         // 149-prefetch STRATA_RAM_ADAPT2: the prompt's routing seeds the RAM policy with a limited weight
         // (STRATA_RAM_ADAPT_PROMPT_W, default 0.25: an expert every prompt token routes to counts like ~5 decode routings),
         // fading by 5% a decode window; the decode's own counts and the GPU tier are untouched
@@ -13429,6 +13619,7 @@ int main(int argc, char** argv) {
                 }
             }
             stop_req.store(false);   // a STOP that arrived between requests is stale
+            in_shared->stop_req.store(false);   // (strati-in-rete: the first PC's stdin STOP as well)
             err.clear();
             // Disk sessions: SAVE <path> | RESTORE <path>, between requests (the path runs to the end of the line,
             // UTF-8).  The file holds what a parked conversation holds (conversation_file.hpp).  Answers: SAVED /
@@ -16735,9 +16926,41 @@ int main(int argc, char** argv) {
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 generation = {};   // a skipped or failed production must not expose an older q view
                 const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
-                const bool drafted = !use_mtp || eos || produced_n >= max_new ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
-                                               nullptr, gated_proposal ? &generation : nullptr);
+                // strati-in-rete: the drafter reads the last stage's final rows, so it runs on that stage's PC and its
+                // drafts travel to the first: both engines build the same next window from them
+                auto net_draft = [&]() -> bool {
+                    const size_t nd = drafts.size();
+                    if (o.net_role == 1) {
+                        strata::net::Msg k;
+                        uint64_t bytes = 0;
+                        strata::net::DraftsHead dh;
+                        if (!net_link.recv_header(k, bytes, err)) return false;
+                        if (k != strata::net::Msg::Drafts || bytes != sizeof dh + nd * (sizeof(int32_t) + sizeof(float)) ||
+                            !net_link.recv_bytes(&dh, sizeof dh, err) || dh.n != (int32_t) nd ||
+                            !net_link.recv_bytes(drafts.data(), nd * sizeof(int32_t), err) ||
+                            !net_link.recv_bytes(dprob.data(), nd * sizeof(float), err)) {
+                            if (err.empty()) err = "strati-in-rete: the other PC's drafts do not match this engine's";
+                            return false;
+                        }
+                        if (dh.ok == 0) err = "strati-in-rete: the drafter on the other PC failed";
+                        return dh.ok != 0;
+                    }
+                    const bool ok = mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
+                                              nullptr, gated_proposal ? &generation : nullptr);
+                    if (o.net_role == 2) {
+                        strata::net::DraftsHead dh;
+                        dh.ok = ok ? 1 : 0;
+                        dh.n = (int32_t) nd;
+                        std::string e;
+                        if (!net_link.send(strata::net::Msg::Drafts, {{&dh, sizeof dh}, {drafts.data(), nd * sizeof(int32_t)},
+                                                                     {dprob.data(), nd * sizeof(float)}}, e)) {
+                            err = e;
+                            return false;
+                        }
+                    }
+                    return ok;
+                };
+                const bool drafted = !use_mtp || eos || produced_n >= max_new || net_draft();
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -17158,6 +17381,15 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s\n",
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
+            }
+            // strati-in-rete, cumulative: the time this engine spent in the stage link (sending, and waiting for the other PC:
+            // its stage on the first PC's side, the first stage's next window on the last PC's side) and what crossed it
+            if (o.net_role != 0) {
+                const strata::core::Verifier& gv = o.net_role == 1 ? stage_ver(n_stages - 1) : ver;
+                std::fprintf(stderr, "strata serve: strati-in-rete: %lld windows, %.1f ms in the link (%.2f ms a window, %.1f of "
+                                     "it waiting), %.1f MB sent, %.1f MB received\n", (long long) gv.net_windows, gv.ms_net,
+                             gv.net_windows > 0 ? gv.ms_net / (double) gv.net_windows : 0.0, net_link.wait_us / 1000.0,
+                             (double) net_link.bytes_sent / 1e6, (double) net_link.bytes_received / 1e6);
             }
             if (drive.d.tail_experts > 0)   // STRATA_ROUTE_TAIL_SKIP, cumulative
                 std::fprintf(stderr, "strata serve: route tail skip: %lld missed experts skipped (%lld entries) since the "

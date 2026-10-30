@@ -2,6 +2,7 @@
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/prefill/copy_events.hpp"
+#include "strata/net/stage_link.hpp"
 #if defined(STRATA_HAVE_DFLASH2)
 #include "strata/kernels/dflash2.hpp"
 #endif
@@ -1226,6 +1227,11 @@ void Prefill::reset() {
 }
 
 void Prefill::release() {
+    if (net_rows_ != nullptr) {   // strati-in-rete: the incoming chunk buffer
+        cudaFreeHost(net_rows_);
+        net_rows_ = nullptr;
+        net_rows_bytes_ = 0;
+    }
     if (!impl_) return;
     impl_->hand_worker.reset();   // idle here (run drains the chain before it returns); joins its thread
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
@@ -1572,18 +1578,19 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     cudaGetDevice(&m.device);
     if (stage_le_ < 0) stage_le_ = g.n_layers;
-    if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ < g.n_layers) != (next_ != nullptr)) {
+    const bool hands_on = next_ != nullptr || net_out_planned_;   // strati-in-rete: the other PC is this stage's next
+    if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ < g.n_layers) != hands_on) {
         err = "prefill: the stage's layer range is wrong";
         return false;
     }
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
-    for (int b = 0; next_ != nullptr && b < 2; ++b)
+    for (int b = 0; hands_on && b < 2; ++b)
         if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
             err = "prefill: the layer split's hand-off buffers";
             return false;
         }
-    if (next_ != nullptr && handoff_pipe_pieces() > 0 && m.hand_pieces == 0) {   // events only: no device memory
+    if (hands_on && handoff_pipe_pieces() > 0 && m.hand_pieces == 0) {   // events only: no device memory
         bool ok = true;
         auto make = [](cudaEvent_t& e) { return e != nullptr || cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess; };
         for (int b = 0; b < 2; ++b) {   // (a retry after a failed init keeps the events it made)
@@ -5618,7 +5625,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
-        if (next_ != nullptr) {
+        if (next_ != nullptr || net_out_ != nullptr) {
             // The current hand-off slot was used two chunks ago.
             float* h = m.hand[hand_buf_];
             const int hp = m.hand_pieces;
@@ -5648,6 +5655,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
             next_err_.clear();
+            if (net_out_ != nullptr) {   // strati-in-rete: the other PC's first stage is this one's next
+                next_run_ = std::async(std::launch::async, [this, h, tokens, c0, T, p0, single_chunk, pipe_chunked] {
+                    return net_send_chunk(h, tokens, c0, T, p0, single_chunk, pipe_chunked);
+                });
+                hand_buf_ ^= 1;
+                continue;
+            }
             next_->hand_in_ = h;
             next_->hand_ev_ = hp > 0 ? static_cast<const void*>(m.hand_ev[hand_buf_]) : nullptr;
             next_->hand_pieces_ = hp;
@@ -7032,6 +7046,125 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     return true;
 }
 
+// strati-in-rete, the first PC's last stage (on its hand-off thread): one chunk's rows to the other PC, then its
+// acknowledgement - what waiting for a local next stage's run_impl of the chunk is
+bool Prefill::net_send_chunk(const float* rows, const int64_t* tokens, int64_t c0, int64_t T, int64_t p0, bool single_chunk,
+                             bool pipe_chunked) {
+    using strata::net::Msg;
+    const core::ModelGeometry& g = *impl_->g;
+    strata::net::ChunkHead ch;
+    ch.c0 = c0;
+    ch.T = T;
+    ch.p0 = p0;
+    ch.single_chunk = single_chunk ? 1 : 0;
+    ch.pipe_chunked = pipe_chunked ? 1 : 0;
+    if (!net_out_->send(Msg::Chunk, {{&ch, sizeof ch}, {tokens + c0, (size_t) T * sizeof(int64_t)},
+                                     {rows, (size_t) T * (size_t) g.hc_dim() * sizeof(float)}}, next_err_))
+        return false;
+    Msg k;
+    uint64_t bytes = 0;
+    strata::net::AckHead a;
+    if (!net_out_->recv_header(k, bytes, next_err_)) return false;
+    if (k != Msg::ChunkAck || bytes < sizeof a || !net_out_->recv_bytes(&a, sizeof a, next_err_) ||
+        bytes != sizeof a + a.err_bytes) {
+        if (next_err_.empty()) next_err_ = "prefill: the other PC answered a chunk with something else";
+        return false;
+    }
+    if (a.ok != 1) {
+        std::string e(a.err_bytes, '\0');
+        if (a.err_bytes > 0 && !net_out_->recv_bytes(e.data(), e.size(), next_err_)) return false;
+        next_err_ = "the other PC's prompt path: " + e;
+        return false;
+    }
+    return true;
+}
+
+// strati-in-rete, the last PC's first stage: the prompt the other PC reads, chunk by chunk as it hands them over (its
+// chunking, which this PC's own planning would not reproduce), each one read as a later stage reads its predecessor's
+bool Prefill::net_run_in(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    using strata::net::Msg;
+    const core::ModelGeometry& g = *impl_->g;
+    const int64_t D = g.hc_dim();
+    bool ok = true;
+    for (;;) {
+        Msg k;
+        uint64_t bytes = 0;
+        if (!net_in_->recv_header(k, bytes, err)) return false;
+        if (k == Msg::PromptEnd) {   // the first PC's read is over: this one ends as it did (a STOP: "cancelled" on both)
+            strata::net::EndHead end;
+            if (bytes < sizeof end || !net_in_->recv_bytes(&end, sizeof end, err) || bytes != sizeof end + end.err_bytes) {
+                if (err.empty()) err = "prefill: the other PC's prompt end is malformed";
+                return false;
+            }
+            std::string theirs(end.err_bytes, '\0');
+            if (end.err_bytes > 0 && !net_in_->recv_bytes(theirs.data(), theirs.size(), err)) return false;
+            if (net_stop_synced_ != nullptr) net_stop_synced_->store(end.stop != 0);
+            if (end.ok != 1 && ok) {
+                ok = false;
+                err = theirs;
+            }
+            break;
+        }
+        strata::net::ChunkHead ch;
+        if (k != Msg::Chunk || bytes < sizeof ch || !net_in_->recv_bytes(&ch, sizeof ch, err)) {
+            if (err.empty()) err = "prefill: the other PC sent something else than a prompt chunk";
+            return false;
+        }
+        const size_t rows_bytes = (size_t) ch.T * (size_t) D * sizeof(float);
+        // where the chunk sits in this run's prompt part: from its position (ch.c0 is the sending stage's own offset,
+        // 0 on a stage that a local stage before it hands one chunk at a time)
+        const int64_t off = ch.p0 - pos0;
+        if (ch.T < 1 || off < 0 || off + ch.T > n || bytes != sizeof ch + (uint64_t) ch.T * sizeof(int64_t) + rows_bytes) {
+            err = "prefill: the two PCs are out of step (chunk of " + std::to_string(ch.T) + " at " + std::to_string(ch.p0) +
+                  " there, a prompt of " + std::to_string(n) + " at " + std::to_string(pos0) + " here)";
+            return false;
+        }
+        std::vector<int64_t> theirs((size_t) ch.T);
+        if (!net_in_->recv_bytes(theirs.data(), theirs.size() * sizeof(int64_t), err)) return false;
+        if (!std::equal(theirs.begin(), theirs.end(), tokens + off)) {
+            err = "prefill: the two PCs are out of step (the chunk at " + std::to_string(ch.p0) + " holds other tokens)";
+            return false;
+        }
+        if (net_rows_bytes_ < rows_bytes) {
+            if (net_rows_ != nullptr) cudaFreeHost(net_rows_);
+            net_rows_ = nullptr;
+            net_rows_bytes_ = 0;
+            if (cudaHostAlloc((void**) &net_rows_, rows_bytes, cudaHostAllocPortable) != cudaSuccess) {
+                err = "prefill: the network chunk buffer (" + std::to_string(rows_bytes >> 20) + " MiB pinned)";
+                return false;
+            }
+            net_rows_bytes_ = rows_bytes;
+        }
+        if (!net_in_->recv_bytes(net_rows_, rows_bytes, err)) return false;
+        hand_in_ = net_rows_;
+        hand_ev_ = nullptr;
+        hand_pieces_ = 0;
+        single_chunk_ = ch.single_chunk != 0;
+        pipe_chunked_ = ch.pipe_chunked != 0;
+        std::string e;
+        const bool r = ok && run_impl(tokens + off, ch.T, ch.p0, e);
+        strata::net::AckHead a;
+        a.ok = r ? 1 : 0;
+        a.err_bytes = r ? 0u : (uint32_t) e.size();
+        std::string se;
+        if (!net_in_->send(Msg::ChunkAck, {{&a, sizeof a}, {e.data(), r ? 0 : e.size()}}, se)) {
+            err = "prefill: " + se;
+            return false;
+        }
+        if (!r && ok) {
+            ok = false;
+            err = e;
+        }
+    }
+    hand_in_ = nullptr;   // this stage is the chain's first again for the PC's own bookkeeping
+    std::string de;
+    if (!drain_pipeline(de) && ok) {
+        ok = false;
+        err = de;
+    }
+    return ok;
+}
+
 bool Prefill::drain_pipeline(std::string& err) {
     bool ok = true;
 
@@ -7085,9 +7218,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
 #else
     constexpr bool lm_hip = false;
 #endif
+    // strati-in-rete: the last PC's first stage reads the chunks the other PC hands it
+    if (net_in_ != nullptr) return net_run_in(tokens, n, pos0, err);
+    Prefill* net_tail = nullptr;   // the first PC: the stage that hands its chunks to the other PC
+    for (Prefill* p = this; p != nullptr; p = p->next_)
+        if (p->net_out_ != nullptr) net_tail = p;
     // layer-major prefill: STRATA_PREFILL_LAYER_MAJOR=1 / 0 win; unset, it is on for a CUDA layer split (sm120_series.hpp
-    // prefill_layer_major_default; STRATA_DEFAULTS=026 and a HIP build leave it off)
-    if (hand_in_ == nullptr && impl_ &&
+    // prefill_layer_major_default; STRATA_DEFAULTS=026 and a HIP build leave it off).  Not across PCs: it walks the
+    // chain's stages itself, and the other PC's are not here.
+    if (hand_in_ == nullptr && impl_ && net_tail == nullptr &&
         strata::prefill_layer_major_resolve(lm_env_text(), lm_hip, stage_count(), strata::qwen_defaults_026())) {
         const bool by_default = !lm_env_explicit();
         for (Prefill* p = this; p != nullptr; p = p->next_) p->lm_by_default_ = by_default;
@@ -7122,6 +7261,25 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
 
     std::string drain_err;
     const bool drain_ok = drain_pipeline(drain_err);
+    // strati-in-rete: every chunk is acknowledged (drained above): the other PC's run() can return, and ends as this
+    // one does - with this run's error (a STOP mid-prompt: "cancelled") and the STOP, latched here for both PCs
+    if (net_tail != nullptr) {
+        strata::net::EndHead end;
+        const std::string why = !body_ok ? err : !drain_ok ? drain_err : std::string();
+        end.ok = body_ok && drain_ok ? 1 : 0;
+        if (net_tail->net_stop_seen_ != nullptr && net_tail->net_stop_synced_ != nullptr) {
+            const bool stop = net_tail->net_stop_seen_->load();
+            net_tail->net_stop_synced_->store(stop);
+            end.stop = stop ? 1 : 0;
+        }
+        end.err_bytes = (uint32_t) why.size();
+        std::string e;
+        if (!net_tail->net_out_->send(strata::net::Msg::PromptEnd, {{&end, sizeof end}, {why.data(), why.size()}}, e) &&
+            body_ok && drain_ok) {
+            err = "prefill: " + e;
+            return false;
+        }
+    }
 
     if (!body_ok) return false;
     if (!drain_ok) {

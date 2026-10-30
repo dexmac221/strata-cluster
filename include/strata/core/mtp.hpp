@@ -128,6 +128,9 @@ public:
     /// window's commit (`tail`) and the window's pick at its last accepted row (`next`, the next window's row 0).
     void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
     void set_ple_session(SessionState* s) { ple_ss_ = s; }
+    /// strati-in-rete: no PLE row prefetch for the drafts - on the last PC the PLE block (layer 1) runs on the other
+    /// PC, so the rows are never read here, and on a slow drive the prefetch cost a draft round ~37 ms (a 5400 rpm hard disk).
+    void disable_ple_prefetch() { ple_off_ = true; }
     std::function<bool(int, float)> chain_rule_;
     bool coupled() const { return coupled_active_; }
     /// PROBABILISTIC DRAFT ACCEPTANCE (core/spec_prob.hpp, STRATA_SPEC_PROB=1): this request's drafts are SAMPLED from
@@ -230,6 +233,7 @@ private:
     const ModelGeometry* g_ = nullptr;
     SessionState* ss_ = nullptr;
     SessionState* ple_ss_ = nullptr;
+    bool ple_off_ = false;   ///< disable_ple_prefetch
     const WeightTable* wt_ = nullptr;
     const NativeHead* head_ = nullptr;
     const float* window_R_ = nullptr;
