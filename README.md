@@ -1,4 +1,4 @@
-> **This is an unofficial fork of Strata 0.2.7.** It adds one experimental feature, a layer split across two PCs over TCP: see [docs/STRATA_CLUSTER.md](docs/STRATA_CLUSTER.md). Strata's authors do not support it. For everything else, use the [original repository](https://github.com/Niko1221/Strata).
+> **This is an unofficial fork of Strata 0.2.7.** It adds one experimental feature, a layer split across two PCs over TCP: the engine option `--net-role first|last` with `--net-split K` and `--net-addr HOST:PORT` (see [docs/STRATA_CLUSTER.md](docs/STRATA_CLUSTER.md)). Strata's authors do not support it. For everything else, use the [original repository](https://github.com/Niko1221/Strata).
 
 <p align="center">
   <picture>
