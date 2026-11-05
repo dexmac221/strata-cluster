@@ -1,5 +1,7 @@
 # strata-cluster: one model, two PCs (unofficial, experimental)
 
+> **Superseded by [Strata Link](https://github.com/lask3802/Strata-Link)** (lask3802), which does the same split, encrypts the link and was faster on my PCs: 32.6 tokens/s against 20.9 for this fork, one GPU per PC, same file and prompts. This page stays as written so its numbers can be reproduced.
+
 This fork adds one feature to Strata 0.2.7 (engine 0.1.52): **a layer split across two PCs over TCP.** It is not
 part of Strata. The authors decided not to build cross-machine splitting
 ([#1256](https://github.com/Niko1221/Strata/issues/1256#issuecomment-6038109482)), so do not report problems with this

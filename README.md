@@ -1,3 +1,5 @@
+> **Use [Strata Link](https://github.com/lask3802/Strata-Link) instead.** lask3802 built the same layer split across PCs before this fork: [#1748](https://github.com/Niko1221/Strata/pull/1748), opened on 9 October 2026 and closed until the link has a security design. Strata Link now encrypts and authenticates the link between the PCs (TLS 1.3, pinned certificates). I missed it when I wrote this fork. On the same two PCs, with the same 4-bit file and the same prompts, one GPU per PC, Strata Link generated 32.6 tokens/s and this fork 20.9. This fork stays up so that the numbers in [docs/STRATA_CLUSTER.md](docs/STRATA_CLUSTER.md) and in the write-up can be reproduced.
+>
 > **This is an unofficial fork of Strata 0.2.7.** It adds one experimental feature, a layer split across two PCs over TCP: the engine option `--net-role first|last` with `--net-split K` and `--net-addr HOST:PORT` (see [docs/STRATA_CLUSTER.md](docs/STRATA_CLUSTER.md)). Strata's authors do not support it. For everything else, use the [original repository](https://github.com/Niko1221/Strata).
 
 <p align="center">
